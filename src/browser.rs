@@ -6,6 +6,7 @@
 
 use crate::css::Stylesheet;
 use crate::html::Document;
+use crate::image::ImageStore;
 use crate::layout::LayoutBox;
 use crate::net::{fetch_page, FetchedPage};
 use std::sync::mpsc::{channel, Receiver};
@@ -23,6 +24,16 @@ pub struct LoadResult {
     pub page: Result<FetchedPage, String>,
 }
 
+/// Messages a worker thread sends to the UI thread.
+enum LoadMsg {
+    /// HTML + CSS are ready: the page can be shown right away.
+    Page(LoadResult),
+    /// Images finished downloading after the page was already on screen.
+    Images {
+        images: Vec<(String, crate::image::DecodedImage)>,
+    },
+}
+
 /// One browser tab.
 pub struct Tab {
     pub id: TabId,
@@ -34,10 +45,12 @@ pub struct Tab {
     pub document: Option<Document>,
     pub stylesheet: Stylesheet,
     pub layout: Option<LayoutBox>,
+    /// Decoded images belonging to the current page.
+    pub images: ImageStore,
     pub status: String,
     pub loading: bool,
     pub error: Option<String>,
-    pending: Option<Receiver<LoadResult>>,
+    pending: Option<Receiver<LoadMsg>>,
 }
 
 impl Tab {
@@ -52,6 +65,7 @@ impl Tab {
             document: None,
             stylesheet: Stylesheet::default(),
             layout: None,
+            images: ImageStore::default(),
             status: "Ready".to_string(),
             loading: false,
             error: None,
@@ -119,6 +133,7 @@ impl Tab {
             self.loading = false;
             self.document = None;
             self.layout = None;
+            self.images = ImageStore::default();
             self.title = "New Tab".to_string();
             self.status = "Ready".to_string();
             self.pending = None;
@@ -128,12 +143,34 @@ impl Tab {
         let tab_id = self.id;
         let url_owned = url.to_string();
         std::thread::spawn(move || {
+            let dbg = std::env::var_os("RUST_BROWSER_DEBUG_LOAD").is_some();
+            if dbg {
+                eprintln!("[load] start {url_owned}");
+            }
             let page = fetch_page(&url_owned);
-            let _ = tx.send(LoadResult {
+            if dbg {
+                eprintln!("[load] fetched: ok={}", page.is_ok());
+            }
+            // Show the document as soon as it is ready...
+            let image_urls = match &page {
+                Ok(p) => p.image_urls.clone(),
+                Err(_) => Vec::new(),
+            };
+            let _ = tx.send(LoadMsg::Page(LoadResult {
                 tab_id,
                 url: url_owned,
                 page,
-            });
+            }));
+            // ...then keep loading its images in the background.
+            if dbg {
+                eprintln!("[load] sent page msg, {} images to go", image_urls.len());
+            }
+            if !image_urls.is_empty() {
+                let images = crate::net::fetch_images(image_urls);
+                if !images.is_empty() {
+                    let _ = tx.send(LoadMsg::Images { images });
+                }
+            }
         });
         self.pending = Some(rx);
     }
@@ -144,8 +181,19 @@ impl Tab {
             return false;
         };
         match rx.try_recv() {
-            Ok(result) => {
-                self.pending = None;
+            Ok(LoadMsg::Images { images }) => {
+                // Page is already visible; drop the images in and re-lay out
+                // so boxes pick up their real sizes.
+                let base = self.url.clone();
+                self.images.set_base_url(base);
+                for (url, image) in images {
+                    self.images.insert(url, image);
+                }
+                self.layout = None;
+                self.status = format!("Loaded {} ({} images)", self.url, self.images.len());
+                true
+            }
+            Ok(LoadMsg::Page(result)) => {
                 self.loading = false;
                 match result.page {
                     Ok(page) => {
@@ -156,6 +204,7 @@ impl Tab {
                         self.status = e;
                         self.document = None;
                         self.layout = None;
+                        self.images = ImageStore::default();
                         self.title = "Error".to_string();
                     }
                 }
@@ -187,6 +236,7 @@ impl Tab {
         }
         self.document = Some(doc);
         self.stylesheet = sheet;
+        self.images = ImageStore::new(page.final_url.clone());
         self.layout = None; // relaid out by the UI with the real viewport width
         self.status = format!("Loaded {}", page.final_url);
         self.url = page.final_url;
@@ -200,8 +250,35 @@ impl Tab {
                 &self.stylesheet,
                 viewport_width,
                 fonts,
+                &self.images,
             ));
         }
+    }
+
+    /// Is a page or its images still arriving? The UI uses this to keep
+    /// polling the event loop instead of sleeping.
+    pub fn is_busy(&self) -> bool {
+        self.pending.is_some() || self.loading
+    }
+
+    /// Total scrollable height: content height minus what fits on screen.
+    pub fn max_scroll(&self, viewport_height: f32) -> f32 {
+        match &self.layout {
+            Some(l) => (l.height - viewport_height).max(0.0),
+            None => 0.0,
+        }
+    }
+
+    /// Scroll by `delta` px, clamped to `[0, max_scroll]`.
+    pub fn scroll_by(&mut self, delta: f32, viewport_height: f32) {
+        let limit = self.max_scroll(viewport_height);
+        self.scroll_y = (self.scroll_y + delta).clamp(0.0, limit);
+    }
+
+    /// Jump to an absolute scroll offset, clamped the same way.
+    pub fn scroll_to(&mut self, y: f32, viewport_height: f32) {
+        let limit = self.max_scroll(viewport_height);
+        self.scroll_y = y.clamp(0.0, limit);
     }
 
     pub fn display_url(&self) -> String {
@@ -210,6 +287,13 @@ impl Tab {
         } else {
             self.url.clone()
         }
+    }
+}
+
+impl Browser {
+    /// Any tab still loading? Drives the event loop's idle behaviour.
+    pub fn is_busy(&self) -> bool {
+        self.tabs.iter().any(|t| t.is_busy())
     }
 }
 
@@ -299,5 +383,55 @@ impl Browser {
 impl Default for Browser {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn long_page_tab() -> Tab {
+        let mut tab = Tab::new(TabId(1));
+        let html = format!("<body>{}</body>", "<p>line of text</p>".repeat(80));
+        tab.document = Some(crate::html::parse(&html));
+        tab.stylesheet = crate::css::ua_stylesheet();
+        tab.relayout(400.0, &crate::render::FontSet::load());
+        tab
+    }
+
+    #[test]
+    fn idle_tab_is_not_busy() {
+        assert!(!Tab::new(TabId(1)).is_busy());
+    }
+
+    #[test]
+    fn scroll_is_clamped_to_content() {
+        let mut tab = long_page_tab();
+        let viewport = 400.0;
+        let limit = tab.max_scroll(viewport);
+        assert!(limit > 0.0, "test page should overflow");
+
+        tab.scroll_by(-100.0, viewport);
+        assert_eq!(tab.scroll_y, 0.0, "cannot scroll above the top");
+
+        tab.scroll_by(limit * 4.0, viewport);
+        assert_eq!(tab.scroll_y, limit, "cannot scroll past the bottom");
+
+        tab.scroll_to(10.0, viewport);
+        assert_eq!(tab.scroll_y, 10.0);
+
+        tab.scroll_to(limit + 500.0, viewport);
+        assert_eq!(tab.scroll_y, limit);
+    }
+
+    #[test]
+    fn short_page_cannot_scroll() {
+        let mut tab = Tab::new(TabId(2));
+        tab.document = Some(crate::html::parse("<body><p>hi</p></body>"));
+        tab.stylesheet = crate::css::ua_stylesheet();
+        tab.relayout(800.0, &crate::render::FontSet::load());
+        assert_eq!(tab.max_scroll(600.0), 0.0);
+        tab.scroll_by(200.0, 600.0);
+        assert_eq!(tab.scroll_y, 0.0);
     }
 }

@@ -18,7 +18,7 @@
 //! Shortcuts: Ctrl+T new tab, Ctrl+W close, Ctrl+L focus address,
 //! Ctrl+R / F5 reload, Alt+Left/Right back/forward, Ctrl+Tab next tab.
 
-use crate::browser::Browser;
+use crate::browser::{Browser, Tab};
 use crate::css::Color;
 use crate::layout::hit_test;
 use crate::render::{render_message, render_page, FontSet, Framebuffer};
@@ -29,6 +29,9 @@ use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::window::{Window, WindowAttributes, WindowId};
+
+const COL_SCROLL_TRACK: Color = Color::rgb(240, 240, 242);
+const COL_SCROLL_THUMB: Color = Color::rgb(170, 172, 178);
 
 const TAB_BAR_H: f32 = 34.0;
 const TOOLBAR_H: f32 = 46.0;
@@ -217,13 +220,21 @@ impl App {
     }
 
     fn ensure_layout(&mut self) {
+        let dbg = std::env::var_os("RUST_BROWSER_DEBUG_LOAD").is_some();
         if self.needs_relayout {
+            let t = std::time::Instant::now();
+            if dbg {
+                eprintln!("[ui] relayout for width {}", self.viewport_rect().2);
+            }
             let vw = self.viewport_rect().2;
             let fonts_ptr: *const FontSet = &self.fonts;
             // SAFETY: fonts outlives this call; we only read through the ptr
             // while holding &mut self.browser (disjoint fields).
             let fonts = unsafe { &*fonts_ptr };
             self.browser.active_tab_mut().relayout(vw, fonts);
+            if dbg {
+                eprintln!("[ui] relayout took {:?}", t.elapsed());
+            }
             self.needs_relayout = false;
         }
     }
@@ -390,6 +401,15 @@ impl App {
                 self.browser.active_tab_mut().reload();
                 self.needs_relayout = true;
             }
+            // Page scrolling (the address bar has its own Home/End handling,
+            // so this branch only runs when it is not focused).
+            Key::Named(NamedKey::PageDown) => self.page_scroll(0.9),
+            Key::Named(NamedKey::PageUp) => self.page_scroll(-0.9),
+            Key::Named(NamedKey::Space) => self.page_scroll(0.9),
+            Key::Named(NamedKey::Home) => self.scroll_to_absolute(0.0),
+            Key::Named(NamedKey::End) => self.scroll_to_bottom(),
+            Key::Named(NamedKey::ArrowDown) => self.page_scroll_step(60.0),
+            Key::Named(NamedKey::ArrowUp) => self.page_scroll_step(-60.0),
             Key::Named(NamedKey::ArrowLeft) if alt => {
                 if self.browser.active_tab_mut().go_back() {
                     self.sync_address_bar();
@@ -405,6 +425,42 @@ impl App {
             _ => {}
         }
         self.request_redraw();
+    }
+
+    /// Scroll by a fraction of the viewport height (page up / page down).
+    fn page_scroll(&mut self, pages: f32) {
+        if self.address_focused {
+            return;
+        }
+        let vh = self.viewport_rect().3;
+        let tab = self.browser.active_tab_mut();
+        tab.scroll_by(pages * vh, vh);
+    }
+
+    /// Scroll by an exact pixel amount.
+    fn page_scroll_step(&mut self, pixels: f32) {
+        if self.address_focused {
+            return;
+        }
+        let vh = self.viewport_rect().3;
+        self.browser.active_tab_mut().scroll_by(pixels, vh);
+    }
+
+    fn scroll_to_absolute(&mut self, y: f32) {
+        if self.address_focused {
+            return;
+        }
+        let vh = self.viewport_rect().3;
+        self.browser.active_tab_mut().scroll_to(y, vh);
+    }
+
+    fn scroll_to_bottom(&mut self) {
+        if self.address_focused {
+            return;
+        }
+        let vh = self.viewport_rect().3;
+        let limit = self.browser.active_tab().max_scroll(vh);
+        self.browser.active_tab_mut().scroll_to(limit, vh);
     }
 
     fn render(&mut self) {
@@ -535,7 +591,7 @@ impl App {
             let vp = self.viewport_rect();
             let tab = self.browser.active_tab();
             if let Some(layout) = &tab.layout {
-                render_page(&mut fb, layout, tab.scroll_y, vp, fonts);
+                render_page(&mut fb, layout, tab.scroll_y, vp, fonts, &tab.images);
             } else if let Some(err) = &tab.error {
                 render_message(
                     &mut fb,
@@ -560,6 +616,9 @@ impl App {
                     fonts,
                 );
             }
+
+            // --- Scrollbar ---
+            draw_scrollbar(&mut fb, vp, tab);
 
             // --- Status bar ---
             let sy = fb_h as f32 - STATUS_H;
@@ -620,6 +679,28 @@ impl App {
             eprintln!("present error: {:?}", e);
         }
     }
+}
+
+/// Overlay scrollbar on the right edge of the viewport. Only shown when the
+/// page is taller than the window.
+fn draw_scrollbar(fb: &mut Framebuffer, viewport: (f32, f32, f32, f32), tab: &Tab) {
+    let (vx, vy, vw, vh) = viewport;
+    let Some(layout) = &tab.layout else {
+        return;
+    };
+    let content = layout.height;
+    if vh <= 1.0 || content <= vh + 1.0 {
+        return;
+    }
+    const W: f32 = 11.0;
+    let track_x = vx + vw - W;
+    fb.fill_rect(track_x, vy, W, vh, COL_SCROLL_TRACK);
+
+    let thumb_h = (vh * (vh / content)).max(28.0).min(vh);
+    let max_scroll = (content - vh).max(1.0);
+    let t = (tab.scroll_y / max_scroll).clamp(0.0, 1.0);
+    let thumb_y = vy + t * (vh - thumb_h);
+    fb.fill_rect(track_x + 2.0, thumb_y, W - 4.0, thumb_h, COL_SCROLL_THUMB);
 }
 
 fn draw_button(
@@ -764,8 +845,8 @@ impl ApplicationHandler for App {
                     MouseScrollDelta::LineDelta(_, y) => y * 28.0,
                     MouseScrollDelta::PixelDelta(pos) => pos.y as f32,
                 };
-                let tab = self.browser.active_tab_mut();
-                tab.scroll_y = (tab.scroll_y + dy).max(0.0);
+                let vh = self.viewport_rect().3;
+                self.browser.active_tab_mut().scroll_by(dy, vh);
                 self.request_redraw();
             }
             WindowEvent::KeyboardInput { event, .. } => {
@@ -783,7 +864,17 @@ impl ApplicationHandler for App {
         }
     }
 
-    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        // A background load finishes on its own thread and cannot wake a
+        // sleeping event loop, so keep a short timeout while anything is in
+        // flight (otherwise a slow page would never be picked up).
+        if self.browser.is_busy() {
+            event_loop.set_control_flow(ControlFlow::WaitUntil(
+                std::time::Instant::now() + std::time::Duration::from_millis(16),
+            ));
+        } else {
+            event_loop.set_control_flow(ControlFlow::Wait);
+        }
         if self.browser.poll_all() {
             self.needs_relayout = true;
             self.sync_address_bar();

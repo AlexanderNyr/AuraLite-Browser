@@ -3,7 +3,18 @@
 //! Fetching runs on a background thread (see `browser::Tab::navigate`)
 //! so the UI thread never blocks on the network.
 
+use crate::image::DecodedImage;
+use std::io::Read;
 use std::time::Duration;
+
+/// Hard cap per image so one huge asset cannot exhaust memory.
+const MAX_IMAGE_BYTES: u64 = 12 * 1024 * 1024;
+/// Cap on how many images one page load will fetch.
+const MAX_IMAGES_PER_PAGE: usize = 48;
+/// Images are downloaded by this many threads at once.
+const IMAGE_WORKERS: usize = 6;
+/// Images get a shorter deadline than the document itself.
+const IMAGE_TIMEOUT: Duration = Duration::from_secs(8);
 use url::Url;
 
 /// A fully fetched page: HTML plus any linked stylesheets.
@@ -13,9 +24,16 @@ pub struct FetchedPage {
     pub html: String,
     /// Contents of `<link rel="stylesheet">` files, in document order.
     pub linked_css: Vec<String>,
+    /// Absolute URLs of images on the page, de-duplicated, for the
+    /// background image loader.
+    pub image_urls: Vec<String>,
 }
 
 /// Fetch `url` (following redirects) and its linked stylesheets.
+///
+/// Images are *not* fetched here: the returned [`FetchedPage::image_urls`]
+/// list is handed to [`fetch_images`] on a background thread so the page can
+/// be laid out and shown immediately.
 pub fn fetch_page(url: &str) -> Result<FetchedPage, String> {
     let (final_url, html) = fetch_text(url)?;
     let doc = crate::html::parse(&html);
@@ -28,24 +46,78 @@ pub fn fetch_page(url: &str) -> Result<FetchedPage, String> {
             }
         }
     }
+    let image_urls = image_urls_for(&final_url, doc.image_srcs());
     Ok(FetchedPage {
         final_url,
         html,
         linked_css,
+        image_urls,
     })
 }
 
-fn fetch_text(url: &str) -> Result<(String, String), String> {
+/// Resolve, de-duplicate and cap the page's image `src` values.
+fn image_urls_for(base_url: &str, srcs: Vec<String>) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    srcs.into_iter()
+        .filter(|s| !s.trim().is_empty())
+        .filter_map(|s| resolve_url(base_url, &s))
+        .filter(|u| seen.insert(u.clone()))
+        .take(MAX_IMAGES_PER_PAGE)
+        .collect()
+}
+
+/// Download and decode a page's images, several at a time.
+///
+/// Sequential downloads made image-heavy pages crawl, so the URLs are pulled
+/// by a small pool of workers and collected through a mutex. Duplicate `src`
+/// values (very common: logos, sprites) are fetched once.
+pub fn fetch_images(urls: Vec<String>) -> Vec<(String, DecodedImage)> {
+    if urls.is_empty() {
+        return Vec::new();
+    }
+
+    let queue = std::sync::Mutex::new(urls.into_iter());
+    let results: std::sync::Mutex<Vec<(String, DecodedImage)>> = std::sync::Mutex::new(Vec::new());
+    std::thread::scope(|scope| {
+        for _ in 0..IMAGE_WORKERS.min(8) {
+            scope.spawn(|| loop {
+                let next = queue.lock().ok().and_then(|mut q| q.next());
+                let Some(url) = next else {
+                    break;
+                };
+                if let Ok((_, bytes)) = fetch_bytes_with_timeout(&url, IMAGE_TIMEOUT) {
+                    if let Some(image) = DecodedImage::decode(&bytes) {
+                        if let Ok(mut out) = results.lock() {
+                            out.push((url, image));
+                        }
+                    }
+                }
+            });
+        }
+    });
+    results.into_inner().unwrap_or_default()
+}
+
+fn request(url: &str, accept: &str) -> Result<(String, ureq::Response), String> {
+    request_with_timeout(url, accept, Duration::from_secs(15))
+}
+
+fn request_with_timeout(
+    url: &str,
+    accept: &str,
+    timeout: Duration,
+) -> Result<(String, ureq::Response), String> {
     let agent = ureq::AgentBuilder::new()
-        .timeout(Duration::from_secs(15))
+        .timeout(timeout)
+        .redirects(8)
         .build();
     let response = agent
         .get(url)
         .set(
             "User-Agent",
-            "rust-browser/0.1 (from-scratch; +https://github.com/example/rust-browser)",
+            "rust-browser/0.1 (from-scratch; +https://github.com/AlexanderNyr/AuraLite-Browser)",
         )
-        .set("Accept", "text/html, text/css, */*")
+        .set("Accept", accept)
         .call()
         .map_err(|e| format!("Network error: {}", e))?;
 
@@ -55,10 +127,34 @@ fn fetch_text(url: &str) -> Result<(String, String), String> {
         .unwrap_or_else(|| url.to_string());
     // ureq follows redirects internally; the effective URL is not exposed
     // in 2.x, so we keep the requested URL unless the server told us.
+    Ok((final_url, response))
+}
+
+fn fetch_text(url: &str) -> Result<(String, String), String> {
+    let (final_url, response) = request(url, "text/html, text/css, */*")?;
     let body = response
         .into_string()
         .map_err(|e| format!("Read error: {}", e))?;
     Ok((final_url, body))
+}
+
+/// Fetch raw bytes (images). Returns `(final_url, bytes)`.
+pub fn fetch_bytes(url: &str) -> Result<(String, Vec<u8>), String> {
+    fetch_bytes_with_timeout(url, Duration::from_secs(15))
+}
+
+fn fetch_bytes_with_timeout(url: &str, timeout: Duration) -> Result<(String, Vec<u8>), String> {
+    let (final_url, response) = request_with_timeout(url, "image/*,*/*", timeout)?;
+    let mut bytes = Vec::new();
+    response
+        .into_reader()
+        .take(MAX_IMAGE_BYTES)
+        .read_to_end(&mut bytes)
+        .map_err(|e| format!("Read error: {}", e))?;
+    if bytes.is_empty() {
+        return Err("empty response".to_string());
+    }
+    Ok((final_url, bytes))
 }
 
 /// Turn user input into a navigable URL.

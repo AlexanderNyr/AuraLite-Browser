@@ -25,6 +25,7 @@ fn main() {
     let doc = rust_browser::html::parse(&html);
     let sheet = rust_browser::css::ua_stylesheet();
     let fonts = rust_browser::render::FontSet::load();
-    let root = layout_document(&doc, &sheet, 760.0, &fonts);
+    let images = rust_browser::image::ImageStore::new("https://example.com/");
+    let root = layout_document(&doc, &sheet, 760.0, &fonts, &images);
     dump(&root, 0);
 }

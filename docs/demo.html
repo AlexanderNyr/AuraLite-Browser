@@ -12,6 +12,7 @@ h1 { color: #8b1e3f; }
 <p class="intro">A browser written from scratch in Rust: our own HTML parser, our own
 CSS engine, our own block and inline layout, and a software rasteriser that
 writes straight into a framebuffer.</p>
+<p><img src="logo.png" width="96" height="96" alt="logo"> <img src="logo.png" width="48" alt="small logo"></p>
 <div class="card">
 <h2>What works today</h2>
 <ul>
@@ -19,9 +20,17 @@ writes straight into a framebuffer.</p>
 <li>HTTP and HTTPS fetching, redirects and linked stylesheets</li>
 <li>Word wrap, margins, padding, colours and <b>bold</b> / <i>italic</i> runs</li>
 <li>Clickable links — hover one and the target shows up in the status bar</li>
+<li><b>PNG and JPEG images</b>, scaled and aspect-ratio aware</li>
+<li>Scrollbar, PageUp/PageDown/Home/End and wheel scrolling</li>
 </ul>
 </div>
 <p class="extra">Styling above comes from the page's own CSS: see the
 <span>coloured headings</span> and the padded card. External stylesheets are
 fetched over the network and applied with a specificity cascade.</p>
+<h2>Long page, just to scroll</h2>
+<p>PageUp, PageDown, Home and End all work, and the overlay scrollbar on the
+right shows where you are. The wheel scrolls a few lines at a time.</p>
+<p>Images are decoded on the loader thread, so the UI stays responsive while
+a heavy page is still downloading its assets.</p>
+<p class="extra">End of the demo page.</p>
 </body></html>

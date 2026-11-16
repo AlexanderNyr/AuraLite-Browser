@@ -22,7 +22,8 @@ fn main() {
     let doc = rust_browser::html::parse(SAMPLE);
     let sheet = ua_stylesheet();
     let fonts = FontSet::load();
-    let root = layout_document(&doc, &sheet, width as f32, &fonts);
+    let images = rust_browser::image::ImageStore::default();
+    let root = layout_document(&doc, &sheet, width as f32, &fonts, &images);
 
     let mut pixels = vec![0u32; width * height];
     {
@@ -33,6 +34,7 @@ fn main() {
             0.0,
             (0.0, 0.0, width as f32, height as f32),
             &fonts,
+            &images,
         );
     }
     write_png(

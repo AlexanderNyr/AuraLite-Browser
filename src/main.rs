@@ -4,6 +4,11 @@
 //!   cargo run                    # open the start page
 //!   cargo run -- example.com     # open a URL (scheme optional)
 
+// Release binaries on Windows use the GUI subsystem so double-clicking the
+// .exe does not spawn a console window. Debug builds keep the console for
+// stderr diagnostics.
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
 use std::process::ExitCode;
 
 fn main() -> ExitCode {

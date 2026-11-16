@@ -12,6 +12,7 @@
 
 use crate::css::{style_for, ComputedStyle, Display, InheritedStyle, Stylesheet, TextAlign};
 use crate::html::{Document, Element, Node};
+use crate::image::ImageStore;
 use crate::render::FontSet;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -88,6 +89,7 @@ pub fn layout_document(
     sheet: &Stylesheet,
     viewport_width: f32,
     fonts: &FontSet,
+    images: &ImageStore,
 ) -> LayoutBox {
     let inherited = InheritedStyle::default();
     let mut ancestors: Vec<&Element> = Vec::new();
@@ -99,6 +101,7 @@ pub fn layout_document(
         &mut ancestors,
         None,
         viewport_width,
+        images,
         fonts,
     );
     root.x = 0.0;
@@ -124,6 +127,7 @@ fn make_absolute(b: &mut LayoutBox, dx: f32, dy: f32) {
 
 /// Lay out one block-level element: resolve its width, then lay out its
 /// children inside its content box.
+#[allow(clippy::too_many_arguments)]
 fn layout_block<'a>(
     el: &'a Element,
     style: &ComputedStyle,
@@ -131,6 +135,7 @@ fn layout_block<'a>(
     ancestors: &mut Vec<&'a Element>,
     link: Option<String>,
     available_width: f32,
+    images: &ImageStore,
     fonts: &FontSet,
 ) -> LayoutBox {
     let margin = style.margin;
@@ -236,6 +241,7 @@ fn layout_block<'a>(
                             ancestors,
                             child_link,
                             content_width,
+                            images,
                             fonts,
                         );
                         child_box.x = content_x + child_style.margin.left;
@@ -253,6 +259,7 @@ fn layout_block<'a>(
                             ancestors,
                             child_link,
                             &mut inline_run,
+                            images,
                         );
                     }
                     Display::None => {}
@@ -286,6 +293,7 @@ fn collect_inline<'a>(
     ancestors: &mut Vec<&'a Element>,
     link: Option<String>,
     out: &mut Vec<InlineItem>,
+    images: &ImageStore,
 ) {
     match el.tag.as_str() {
         "br" => {
@@ -293,8 +301,12 @@ fn collect_inline<'a>(
             return;
         }
         "img" => {
+            let src = el.attr("src").unwrap_or("").to_string();
             out.push(InlineItem::Image {
-                src: el.attr("src").unwrap_or("").to_string(),
+                intrinsic: images.get(&src).map(|i| i.size()),
+                attr_w: el.attr("width").and_then(|v| v.trim().parse::<f32>().ok()),
+                attr_h: el.attr("height").and_then(|v| v.trim().parse::<f32>().ok()),
+                src,
                 alt: el.attr("alt").unwrap_or("").to_string(),
                 style: style.clone(),
                 link: link.clone(),
@@ -336,15 +348,63 @@ fn collect_inline<'a>(
                     // Block inside inline: degrade gracefully — break line,
                     // then collect its inline content.
                     out.push(InlineItem::Break);
-                    collect_inline(child_el, &child_style, sheet, ancestors, child_link, out);
+                    collect_inline(
+                        child_el,
+                        &child_style,
+                        sheet,
+                        ancestors,
+                        child_link,
+                        out,
+                        images,
+                    );
                     out.push(InlineItem::Break);
                 } else {
-                    collect_inline(child_el, &child_style, sheet, ancestors, child_link, out);
+                    collect_inline(
+                        child_el,
+                        &child_style,
+                        sheet,
+                        ancestors,
+                        child_link,
+                        out,
+                        images,
+                    );
                 }
             }
         }
     }
     ancestors.pop();
+}
+
+/// Resolve the used size of an `<img>` box.
+///
+/// Priority: CSS `width`/`height` → HTML `width`/`height` attributes →
+/// the image's intrinsic size. A single known dimension preserves the
+/// natural aspect ratio; with nothing known we reserve a 64x64 placeholder.
+fn image_size(
+    style: &ComputedStyle,
+    intrinsic: Option<(f32, f32)>,
+    attr_w: Option<f32>,
+    attr_h: Option<f32>,
+    available: f32,
+) -> (f32, f32) {
+    let css_w = style.width.map(|l| l.resolve(available));
+    let css_h = style.height.map(|l| l.resolve(available));
+    let ratio = intrinsic.and_then(|(iw, ih)| {
+        if iw > 0.0 && ih > 0.0 {
+            Some(iw / ih)
+        } else {
+            None
+        }
+    });
+    match (css_w.or(attr_w), css_h.or(attr_h)) {
+        // Both dimensions given: use them verbatim.
+        (Some(w), Some(h)) => (w, h),
+        // One dimension given: derive the other from the natural ratio.
+        (Some(w), None) => (w, ratio.map(|r| w / r).unwrap_or(w)),
+        (None, Some(h)) => (ratio.map(|r| h * r).unwrap_or(h), h),
+        // Nothing given: fall back to the intrinsic size, else a placeholder.
+        (None, None) => intrinsic.unwrap_or((64.0, 64.0)),
+    }
 }
 
 enum InlineItem {
@@ -358,6 +418,10 @@ enum InlineItem {
         alt: String,
         style: ComputedStyle,
         link: Option<String>,
+        /// Natural pixel size, if the image was decoded.
+        intrinsic: Option<(f32, f32)>,
+        attr_w: Option<f32>,
+        attr_h: Option<f32>,
     },
     Break,
 }
@@ -365,12 +429,18 @@ enum InlineItem {
 /// A word (or image) ready to be placed on a line.
 struct Word {
     text: Option<String>,
-    image: Option<(String, String)>,
+    image: Option<ImageSpec>,
     style: ComputedStyle,
     link: Option<String>,
     width: f32,
     height: f32,
     space_before: bool,
+}
+
+/// Everything the line breaker needs to place an `<img>`.
+struct ImageSpec {
+    src: String,
+    alt: String,
 }
 
 /// Lay out a run of inline items into line boxes (word wrap).
@@ -406,14 +476,16 @@ fn layout_inline_run(
                 alt,
                 style,
                 link,
+                intrinsic,
+                attr_w,
+                attr_h,
             } => {
                 let space_before = pending_space && !words.is_empty();
                 pending_space = false;
-                let w = style.width.map(|l| l.resolve(width)).unwrap_or(64.0);
-                let h = style.height.map(|l| l.resolve(width)).unwrap_or(64.0);
+                let (w, h) = image_size(&style, intrinsic, attr_w, attr_h, width);
                 words.push(Word {
                     text: None,
-                    image: Some((src, alt)),
+                    image: Some(ImageSpec { src, alt }),
                     style,
                     link,
                     width: w,
@@ -566,11 +638,11 @@ fn layout_inline_run(
                     bx.height = word.height;
                     bx
                 }
-                (None, Some((src, alt))) => {
+                (None, Some(spec)) => {
                     let mut bx = LayoutBox::new(
                         BoxKind::Image {
-                            src: src.clone(),
-                            alt: alt.clone(),
+                            src: spec.src.clone(),
+                            alt: spec.alt.clone(),
                         },
                         word.style.clone(),
                         word.link.clone(),
@@ -598,10 +670,19 @@ mod tests {
     use crate::html;
 
     fn layout(html: &str, width: f32) -> LayoutBox {
+        layout_with_images(html, width, &ImageStore::default())
+    }
+
+    fn layout_with_images(html: &str, width: f32, images: &ImageStore) -> LayoutBox {
         let doc = html::parse(html);
         let sheet = crate::css::ua_stylesheet();
         let fonts = FontSet::load();
-        layout_document(&doc, &sheet, width, &fonts)
+        layout_document(&doc, &sheet, width, &fonts, images)
+    }
+
+    fn card_image() -> crate::image::DecodedImage {
+        crate::image::DecodedImage::decode(include_bytes!("../assets/tests/card.png"))
+            .expect("test card decodes")
     }
 
     #[test]
@@ -717,7 +798,8 @@ mod tests {
         let sheet = Stylesheet::parse(".hidden { display: none }");
         let doc = html::parse(r#"<body><p class="hidden">secret</p><p>shown</p></body>"#);
         let fonts = FontSet::load();
-        let root = layout_document(&doc, &sheet, 800.0, &fonts);
+        let images = ImageStore::default();
+        let root = layout_document(&doc, &sheet, 800.0, &fonts, &images);
         fn all_text(b: &LayoutBox, out: &mut String) {
             if let BoxKind::Text(t) = &b.kind {
                 out.push_str(t);
@@ -730,5 +812,41 @@ mod tests {
         all_text(&root, &mut text);
         assert!(text.contains("shown"));
         assert!(!text.contains("secret"));
+    }
+
+    #[test]
+    fn image_uses_intrinsic_size_when_decoded() {
+        // card.png is 4x4, so the box should be 4x4 unless CSS says otherwise.
+        let mut images = ImageStore::new("https://example.com/page.html");
+        images.insert("https://example.com/card.png".into(), card_image());
+        let root = layout_with_images(
+            r#"<body><p><img src="card.png"></p></body>"#,
+            600.0,
+            &images,
+        );
+        let p = &root.children[0].children[0];
+        let img = &p.children[0];
+        assert_eq!((img.width, img.height), (4.0, 4.0));
+    }
+
+    #[test]
+    fn image_keeps_aspect_ratio_with_one_dimension() {
+        let mut images = ImageStore::new("https://example.com/");
+        images.insert("https://example.com/card.png".into(), card_image());
+        // Square source scaled to width 40 keeps a 40x40 box.
+        let root = layout_with_images(
+            r#"<body><p><img src="card.png" width="40"></p></body>"#,
+            600.0,
+            &images,
+        );
+        let img = &root.children[0].children[0].children[0];
+        assert_eq!((img.width, img.height), (40.0, 40.0));
+    }
+
+    #[test]
+    fn missing_image_falls_back_to_placeholder() {
+        let root = layout(r#"<body><p><img src="nope.png"></p></body>"#, 600.0);
+        let img = &root.children[0].children[0].children[0];
+        assert_eq!((img.width, img.height), (64.0, 64.0));
     }
 }

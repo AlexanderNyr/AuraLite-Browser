@@ -134,6 +134,15 @@ impl Document {
     }
 
     /// `href`s of `<link rel="stylesheet">` in document order.
+    /// `src` of every `<img>` in document order.
+    pub fn image_srcs(&self) -> Vec<String> {
+        self.root
+            .find_all("img")
+            .into_iter()
+            .filter_map(|e| e.attr("src").map(|s| s.to_string()))
+            .collect()
+    }
+
     pub fn stylesheet_hrefs(&self) -> Vec<String> {
         self.root
             .find_all("link")

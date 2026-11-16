@@ -6,6 +6,7 @@
 //! so the renderer is testable without a window.
 
 use crate::css::Color;
+use crate::image::{DecodedImage, ImageStore};
 use crate::layout::LayoutBox;
 use fontdue::{Font, FontSettings};
 
@@ -107,6 +108,9 @@ pub struct Framebuffer<'a> {
     pub pixels: &'a mut [u32],
     pub width: usize,
     pub height: usize,
+    /// Clip rectangle in pixels. Everything drawn outside it is discarded,
+    /// which is what keeps a scrolled page from painting over the chrome.
+    clip: (i32, i32, i32, i32),
 }
 
 impl<'a> Framebuffer<'a> {
@@ -115,6 +119,7 @@ impl<'a> Framebuffer<'a> {
             pixels,
             width,
             height,
+            clip: (0, 0, width as i32, height as i32),
         }
     }
 
@@ -130,15 +135,40 @@ impl<'a> Framebuffer<'a> {
     }
 
     /// Filled rectangle (clipped to the framebuffer).
+    /// Is this pixel inside the current clip rectangle?
+    pub fn in_clip(&self, x: usize, y: usize) -> bool {
+        let (x, y) = (x as i32, y as i32);
+        x >= self.clip.0 && y >= self.clip.1 && x < self.clip.2 && y < self.clip.3
+    }
+
+    /// Restrict drawing to `rect` (framebuffer pixel space).
+    pub fn set_clip(&mut self, rect: (f32, f32, f32, f32)) {
+        self.clip = Self::clip_rect(rect, self.width, self.height);
+    }
+
+    /// Restore drawing to the whole framebuffer.
+    pub fn clear_clip(&mut self) {
+        self.clip = (0, 0, self.width as i32, self.height as i32);
+    }
+
+    fn clip_rect(rect: (f32, f32, f32, f32), width: usize, height: usize) -> (i32, i32, i32, i32) {
+        let (x, y, w, h) = rect;
+        let x0 = (x.floor() as i32).max(0);
+        let y0 = (y.floor() as i32).max(0);
+        let x1 = ((x + w).ceil() as i32).min(width as i32);
+        let y1 = ((y + h).ceil() as i32).min(height as i32);
+        (x0, y0, x1, y1)
+    }
+
     pub fn fill_rect(&mut self, x: f32, y: f32, w: f32, h: f32, color: Color) {
         let x0 = x.floor() as i32;
         let y0 = y.floor() as i32;
         let x1 = (x + w).ceil() as i32;
         let y1 = (y + h).ceil() as i32;
-        let xa = x0.max(0);
-        let ya = y0.max(0);
-        let xb = x1.min(self.width as i32);
-        let yb = y1.min(self.height as i32);
+        let xa = x0.max(self.clip.0);
+        let ya = y0.max(self.clip.1);
+        let xb = x1.min(self.clip.2);
+        let yb = y1.min(self.clip.3);
         if xa >= xb || ya >= yb {
             return;
         }
@@ -196,7 +226,11 @@ impl<'a> Framebuffer<'a> {
                     };
                     let px = gx + col as i32 + shear;
                     let py = gy + row as i32;
-                    if px < 0 || py < 0 || px as usize >= self.width || py as usize >= self.height {
+                    if px < self.clip.0
+                        || py < self.clip.1
+                        || px >= self.clip.2
+                        || py >= self.clip.3
+                    {
                         continue;
                     }
                     let idx = py as usize * self.width + px as usize;
@@ -240,11 +274,15 @@ pub fn render_page(
     scroll_y: f32,
     viewport: (f32, f32, f32, f32),
     fonts: &FontSet,
+    images: &ImageStore,
 ) {
     let (vx, vy, vw, vh) = viewport;
-    // Page background.
+    // Everything below is clipped to the viewport so a scrolled page can
+    // never paint over the browser chrome.
+    fb.set_clip(viewport);
     fb.fill_rect(vx, vy, vw, vh, Color::rgb(255, 255, 255));
-    render_box(fb, root, (vx, vy - scroll_y), viewport, fonts);
+    render_box(fb, root, (vx, vy - scroll_y), viewport, fonts, images);
+    fb.clear_clip();
 }
 
 /// `origin` translates page coordinates (absolute, from `layout`) into
@@ -256,6 +294,7 @@ fn render_box(
     origin: (f32, f32),
     viewport: (f32, f32, f32, f32),
     fonts: &FontSet,
+    images: &ImageStore,
 ) {
     let (vx, vy, vw, vh) = viewport;
     let (ox, oy) = origin;
@@ -284,24 +323,10 @@ fn render_box(
                 fb.fill_rect(x, ty, b.width, 1.0, b.style.color);
             }
         }
-        crate::layout::BoxKind::Image { alt, .. } => {
-            // Placeholder: grey box with alt text (real image decoding is
-            // on the roadmap — see README).
-            fb.fill_rect(x, y, b.width, b.height, Color::rgb(220, 220, 220));
-            fb.stroke_rect(x, y, b.width, b.height, Color::rgb(160, 160, 160));
-            if !alt.is_empty() {
-                fb.draw_text(
-                    x + 4.0,
-                    y + 4.0,
-                    alt,
-                    12.0,
-                    Color::rgb(80, 80, 80),
-                    false,
-                    false,
-                    fonts,
-                );
-            }
-        }
+        crate::layout::BoxKind::Image { src, alt } => match images.get(src) {
+            Some(img) => blit_image(fb, img, (x, y, b.width, b.height), viewport),
+            None => draw_image_placeholder(fb, (x, y, b.width, b.height), alt, fonts),
+        },
         crate::layout::BoxKind::Br => {}
         // List items get a bullet in their (indented) left margin.
         crate::layout::BoxKind::Block { tag } if tag == "li" => {
@@ -320,7 +345,68 @@ fn render_box(
     }
 
     for child in &b.children {
-        render_box(fb, child, origin, viewport, fonts);
+        render_box(fb, child, origin, viewport, fonts, images);
+    }
+}
+
+/// Grey box + alt text, drawn when an image could not be fetched or decoded.
+fn draw_image_placeholder(
+    fb: &mut Framebuffer,
+    rect: (f32, f32, f32, f32),
+    alt: &str,
+    fonts: &FontSet,
+) {
+    let (x, y, w, h) = rect;
+    fb.fill_rect(x, y, w, h, Color::rgb(220, 220, 220));
+    fb.stroke_rect(x, y, w, h, Color::rgb(160, 160, 160));
+    if !alt.is_empty() {
+        fb.draw_text(
+            x + 4.0,
+            y + 4.0,
+            alt,
+            12.0,
+            Color::rgb(80, 80, 80),
+            false,
+            false,
+            fonts,
+        );
+    }
+}
+
+/// Scale a decoded image into a box (nearest-neighbour) and clip it to the
+/// viewport. Cheap, deterministic and good enough for text-ish web images;
+/// a bilinear sampler can replace this later without touching callers.
+fn blit_image(
+    fb: &mut Framebuffer,
+    img: &DecodedImage,
+    dst: (f32, f32, f32, f32),
+    viewport: (f32, f32, f32, f32),
+) {
+    let (dx, dy, dw, dh) = dst;
+    if dw < 1.0 || dh < 1.0 || img.width == 0 || img.height == 0 {
+        return;
+    }
+    let (vx, vy, vw, vh) = viewport;
+    let x0 = dx.max(vx).floor() as i64;
+    let y0 = dy.max(vy).floor() as i64;
+    let x1 = ((dx + dw).min(vx + vw)).ceil() as i64;
+    let y1 = ((dy + dh).min(vy + vh)).ceil() as i64;
+    for py in y0..y1 {
+        let fy = (py as f32 - dy) / dh;
+        let sy = ((fy * img.height as f32) as usize).min(img.height - 1);
+        for px in x0..x1 {
+            let fx = (px as f32 - dx) / dw;
+            let sx = ((fx * img.width as f32) as usize).min(img.width - 1);
+            let colour = img.pixels[sy * img.width + sx];
+            if px < 0 || py < 0 {
+                continue;
+            }
+            let (px, py) = (px as usize, py as usize);
+            if px >= fb.width || py >= fb.height || !fb.in_clip(px, py) {
+                continue;
+            }
+            fb.pixels[py * fb.width + px] = colour;
+        }
     }
 }
 

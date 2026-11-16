@@ -5,6 +5,7 @@
 //! ```text
 //! net.rs      HTTP/HTTPS fetching (ureq + rustls), URL handling
 //! html.rs     HTML tokenizer + DOM builder (from scratch)
+//! image.rs    PNG/JPEG decoding into framebuffer pixels
 //! css.rs      CSS parser, cascade, computed styles (from scratch)
 //! layout.rs   block layout + inline formatting / word wrap
 //! render.rs   font rasterisation (fontdue) + framebuffer drawing
@@ -20,6 +21,7 @@ pub mod app;
 pub mod browser;
 pub mod css;
 pub mod html;
+pub mod image;
 pub mod layout;
 pub mod net;
 pub mod render;
