@@ -1,0 +1,31 @@
+[package]
+name = "rust-browser"
+version = "0.1.0"
+edition = "2021"
+description = "A minimal web browser written from scratch in Rust — own HTML/CSS engine, layout and renderer on winit + softbuffer"
+license = "MIT"
+repository = "https://github.com/AlexanderNyr/AuraLite-Browser"
+homepage = "https://github.com/AlexanderNyr/AuraLite-Browser"
+documentation = "https://docs.rs/rust-browser"
+keywords = ["browser", "html", "css", "renderer", "gui"]
+categories = ["gui", "web-programming"]
+readme = "README.md"
+rust-version = "1.75"
+
+[dependencies]
+winit = "0.30"
+softbuffer = "0.4"
+fontdue = "0.9"
+ureq = { version = "2.10", features = ["tls"] }
+url = "2.5"
+
+[dev-dependencies]
+# integration tests use only the library crate
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+
+[profile.dev]
+opt-level = 0

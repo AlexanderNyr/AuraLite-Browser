@@ -1,0 +1,27 @@
+<!doctype html>
+<html><head><title>Rust Browser — demo</title>
+<style>
+body { background: #ffffff; }
+h1 { color: #8b1e3f; }
+.intro { color: #333333; }
+.card { background: #f3f6fb; padding: 12px; margin: 12px 0; }
+.extra { color: #777777; }
+</style></head>
+<body>
+<h1>Rust Browser</h1>
+<p class="intro">A browser written from scratch in Rust: our own HTML parser, our own
+CSS engine, our own block and inline layout, and a software rasteriser that
+writes straight into a framebuffer.</p>
+<div class="card">
+<h2>What works today</h2>
+<ul>
+<li>Tabs, back/forward history and reload</li>
+<li>HTTP and HTTPS fetching, redirects and linked stylesheets</li>
+<li>Word wrap, margins, padding, colours and <b>bold</b> / <i>italic</i> runs</li>
+<li>Clickable links — hover one and the target shows up in the status bar</li>
+</ul>
+</div>
+<p class="extra">Styling above comes from the page's own CSS: see the
+<span>coloured headings</span> and the padded card. External stylesheets are
+fetched over the network and applied with a specificity cascade.</p>
+</body></html>
